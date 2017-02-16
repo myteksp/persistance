@@ -1,0 +1,1163 @@
+package com.gf.persistance.impl.maps;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
+
+import com.gf.persistance.PersistanceFactory;
+import com.gf.persistance.PersistedLongList;
+import com.gf.persistance.PersistedMap;
+import com.gf.persistance.impl.CollectionsAccessBuffer;
+
+/**
+ * Files structure of hashMap:
+ * The storage consists of linked forest indexed by hash function
+ * 
+ * 
+ * @author dmitry paradny
+ */
+public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
+	private final File storage_file;
+	private final RandomAccessFile ra_file;
+	private final int gc_balance;
+	private final int gc_lower_balance;
+	private final AtomicInteger gc_counter;
+	private final MappedByteBuffer offsetBuffer;
+	private final ReentrantLock offsetLock;
+	private final AtomicLong _offset;
+	private final ConcurrentHashMap<Long, CollectionsAccessBuffer> buffers;
+	private final PersistedLongList<Long> index_list;
+	private final AtomicLong _size;
+	private final ReentrantLock sizeLocker;
+	private final MappedByteBuffer sizeBuffer;
+	private final long capacity;
+
+	public ByteArrayMap(final File index_file, final File storage_file, final int gc_balance, final long capacity){
+		this.capacity = capacity;
+		this.storage_file = storage_file;
+		this.gc_balance = gc_balance;
+		this.gc_lower_balance = gc_balance/2;
+		this.gc_counter = new AtomicInteger(0);
+		this.offsetLock = new ReentrantLock(true);
+		this.sizeLocker = new ReentrantLock(true);
+		this.buffers = new ConcurrentHashMap<Long, CollectionsAccessBuffer>();
+		this.index_list = PersistanceFactory.createLongList(index_file, storage_file, gc_balance, Long.class);
+
+		if (!storage_file.exists()){
+			try {
+				storage_file.createNewFile();
+			} catch (IOException e) {
+				throw new RuntimeException(e);
+			}
+			try {
+				this.ra_file = new RandomAccessFile(storage_file, "rw");
+				this.offsetBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, Long.BYTES);
+				this.offsetBuffer.position(0);
+				this.offsetBuffer.putLong(new Integer(Long.BYTES).longValue());
+				this._offset = new AtomicLong(new Integer(Long.BYTES + Long.BYTES).longValue());
+
+				this.sizeBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, Long.BYTES, Long.BYTES);
+			} catch (final Exception e) {
+				throw new RuntimeException(e);
+			}
+			this._size = new AtomicLong(0);
+
+			for (long i = 0; i < capacity; i++) {
+				index_list.add((long) -1);
+			}
+			setSize(0);
+		}else{
+			try {
+				this.ra_file = new RandomAccessFile(storage_file, "rw");
+				this.offsetBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, Long.BYTES);
+				this.offsetBuffer.position(0);
+				this._offset = new AtomicLong(this.offsetBuffer.getLong());
+				this.sizeBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, Long.BYTES, Long.BYTES);
+				this.sizeBuffer.position(0);
+				this._size = new AtomicLong(sizeBuffer.getLong());
+			} catch (final Exception e) {
+				throw new RuntimeException(e);
+			}
+		}
+	}
+
+	private final void setSize(final long size){
+		sizeLocker.lock();
+		try{
+			sizeBuffer.position(0);
+			sizeBuffer.putLong(size);
+		}finally{
+			sizeLocker.unlock();
+		}
+	}
+	private final long incrementSize(final long delta){
+		final long result = _size.getAndAdd(delta);
+		this.setSize(_size.get());
+		return result;
+	}
+	private final CollectionsAccessBuffer getBuffer(final long range){
+		try{
+			CollectionsAccessBuffer result = buffers.get(range);
+			if (result == null){
+				final int tmpSize = Entry.calculateSize(0);
+				final MappedByteBuffer buf = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, range, tmpSize);
+				buf.position(Entry.sizePosition);
+				final int entitySize = Entry.calculateSize(buf.getInt() + buf.getInt());
+
+				final CollectionsAccessBuffer candidate = new CollectionsAccessBuffer(ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, range, entitySize), entitySize);
+				result = buffers.putIfAbsent(range, candidate);
+				if (result == null){
+					result = candidate;
+					gc_if_needed();
+				}else{
+					candidate.dispose();
+					result.lastAccess.set(System.currentTimeMillis());
+				}
+			}else{
+				result.lastAccess.set(System.currentTimeMillis());
+			}
+			return result;
+		}catch(final Throwable t){
+			throw new RuntimeException("Failed to get range: " + range,t);
+		}
+	}
+	private final long incrementOffset(final long delta){
+		final long result = _offset.getAndAdd(delta);
+		this.setOffset(_offset.get());
+		return result;
+	}
+	private final void setOffset(final long size){
+		offsetLock.lock();
+		try{
+
+			offsetBuffer.position(0);
+			offsetBuffer.putLong(size);
+		}finally{
+			offsetLock.unlock();
+		}
+	}
+	private final Object[] allocateBuffer(final int size){
+		final long range = incrementOffset(Integer.valueOf(size).longValue());
+		try{
+			final CollectionsAccessBuffer result = new CollectionsAccessBuffer(ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, range, size), size);
+			result.lastAccess.set(System.currentTimeMillis());
+			buffers.put(range, result);
+			gc_if_needed();
+			return new Object[]{result, range};
+		}catch(final Throwable t){
+			throw new RuntimeException("Failed to alocate range: " + range + " of size " + size, t);
+		}
+	}
+	private final void gc_if_needed(){
+		if (gc_counter.incrementAndGet() > gc_balance){
+			gc_counter.set(0);
+			final int toRemove = gc_balance - gc_lower_balance;
+			final ArrayList<Long> keys = new ArrayList<Long>(buffers.size());
+
+			for(final Long key : buffers.keySet())
+				keys.add(key);
+
+			keys.sort(new Comparator<Long>() {
+				@Override
+				public final int compare(final Long key1, final Long key2) {
+					return Long.compare(buffers.get(key1).lastAccess.get(), buffers.get(key2).lastAccess.get());
+				}
+			});
+
+			int index = keys.size() - 1;
+			for (int i = 0; i < toRemove; i++) {
+				final CollectionsAccessBuffer buf = buffers.remove(keys.get(index));
+
+				if (buf != null)
+					buf.dispose();
+
+				index--;
+			}
+		}
+	}
+	private static final boolean arrayEquals(final byte[] a1, final byte[]  a2){
+		if (a1 == null)
+			if (a2 == null)
+				return true;
+			else
+				return false;
+		else
+			if (a2 == null)
+				return false;
+			else{
+				final int len = a1.length;
+				if (len != a2.length)
+					return false;
+				else{
+					for (int i = 0; i < a1.length; i++) 
+						if (a1[i] != a2[i])
+							return false;
+
+					return true;
+				}
+			}
+	}
+
+
+	@Override
+	public final File getIndexFile() {
+		return index_list.getIndexFile();
+	}
+
+	@Override
+	public final File getStorageFile() {
+		return storage_file;
+	}
+
+	@Override
+	public final void delete() {
+		try{this.clear();}catch(final Throwable t){}
+		try{this.close();}catch(final Throwable t){}
+		try{this.index_list.delete();}catch(final Throwable t){}
+		try{this.storage_file.delete();}catch(final Throwable t){}
+	}
+
+	@Override
+	public final void close() throws IOException {
+		try{ra_file.close();}catch(final Throwable t){}
+		try{index_list.close();}catch(final Throwable t){}
+	}
+
+	private static final int hash(final byte[] key) {
+		int h;
+		return (h = Arrays.hashCode(key)) ^ (h >>> 16);
+	}
+	private final int getIndex(final byte[] key){
+		final int hash = hash(key);
+		return (Long.valueOf(capacity).intValue() - 1) & hash;
+	}
+
+	private final Entry getEntry(final long pointer){
+		if (pointer < 0)
+			return null;
+
+		return new Entry(getBuffer(pointer));
+	}
+	@Override
+	public final byte[] put(final byte[] key, final byte[] value) {
+		final int index = getIndex(key);
+		final long pointer = index_list.get(index);
+		if (pointer < 0){
+			final int key_value_len = value.length + key.length;
+			final Object[] arr = allocateBuffer(Entry.calculateSize(key_value_len));
+			final CollectionsAccessBuffer buf = (CollectionsAccessBuffer) arr[0];
+			final Long newPointer = (Long) arr[1];
+			new Entry(buf, value, key);
+			index_list.set(index, newPointer);
+			this.incrementSize(1);
+			return null;
+		}else{
+			Entry entry = null;
+			long next = pointer;
+			while((entry = getEntry(next)) != null){
+				final long prev = next;
+				entry.lock();
+				try{
+					next = entry.getNextIndex();
+					if (arrayEquals(key, entry.getKey())){
+						final byte[] result = entry.getValue();
+						if (value.length <= result.length){
+							entry.setValue(value);
+						}else{
+							buffers.remove(prev);
+							final int key_value_len = value.length + key.length;
+							final Object[] arr = allocateBuffer(Entry.calculateSize(key_value_len));
+							final CollectionsAccessBuffer buf = (CollectionsAccessBuffer) arr[0];
+							final Long newPointer = (Long) arr[1];
+							final Entry newEntry = new Entry(buf, value, key);
+							newEntry.lock();
+							try{
+								if (entry.getPreviousIndex() < 0){
+									if (next < 0){
+										index_list.set(index, newPointer);
+									}else{
+										newEntry.setNext(next);
+										index_list.set(index, newPointer);
+									}
+								}else{
+									newEntry.setPrevious(entry.getPreviousIndex());
+									if (next < 0){
+										index_list.set(index, newPointer);
+									}else{
+										newEntry.setNext(next);
+										index_list.set(index, newPointer);
+									}
+								}
+							}finally{
+								newEntry.unlock();
+							}
+							entry.dispose();
+						}
+						return result;
+					}else{
+						if (next < 0){
+							final int key_value_len = value.length + key.length;
+							final Object[] arr = allocateBuffer(Entry.calculateSize(key_value_len));
+							final CollectionsAccessBuffer buf = (CollectionsAccessBuffer) arr[0];
+							final Long newPointer = (Long) arr[1];
+							final Entry newEntry = new Entry(buf, value, key);
+							newEntry.lock();
+							try{
+								entry.setNext(newPointer);
+								newEntry.setPrevious(prev);
+								this.incrementSize(1);
+							}finally{
+								newEntry.unlock();
+							}
+							return null;
+						}
+					}
+				}finally{
+					entry.unlock();
+				}
+			}
+			throw new RuntimeException("Inconsistent index. While range was positive, no key was found.");
+		}
+	}
+	@Override
+	public final byte[] get(final Object obj_key) {
+		if (obj_key == null)
+			throw new NullPointerException("Unlike an JDK map, persisted map can not accept null keys or null values.");
+
+		if (!(obj_key instanceof byte[]))
+			throw new RuntimeException("Got key of type '" +obj_key.getClass().getName() + "' but was expecting '" + byte[].class.getName() + "'.");
+
+		final byte[] key = (byte[]) obj_key;
+		final int index = getIndex(key);
+		final long pointer = index_list.get(index);
+		if (pointer < 0)
+			return null;
+
+		Entry entry = null;
+		long next = pointer;
+		while((entry = getEntry(next)) != null){
+			entry.lock();
+			try{
+				if (arrayEquals(key, entry.getKey()))
+					return entry.getValue();
+				else
+					next = entry.getNextIndex();
+			}finally{
+				entry.unlock();
+			}
+		}
+		return null;
+	}
+
+	@Override
+	public final boolean isEmpty() {
+		switch(this.size()){
+		case 0:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	@Override
+	public final boolean containsKey(final Object obj_key) {
+		if (obj_key == null)
+			throw new NullPointerException("Unlike an JDK map, persisted map can not accept null keys or null values.");
+
+		if (!(obj_key instanceof byte[]))
+			throw new RuntimeException("Got key of type '" +obj_key.getClass().getName() + "' but was expecting '" + byte[].class.getName() + "'.");
+
+		final byte[] key = (byte[]) obj_key;
+		final int index = getIndex(key);
+		final long pointer = index_list.get(index);
+		if (pointer < 0)
+			return false;
+
+		Entry entry = null;
+		long next = pointer;
+		while((entry = getEntry(next)) != null){
+			entry.lock();
+			try{
+				if (arrayEquals(key, entry.getKey()))
+					return true;
+				else
+					next = entry.getNextIndex();
+			}finally{
+				entry.unlock();
+			}
+		}
+		return false;
+	}
+
+	@Override
+	public final boolean containsValue(final Object value) {
+		if (value == null)
+			throw new NullPointerException("Unlike an JDK map, persisted map can not accept null keys or null values.");
+
+		if (!(value instanceof byte[]))
+			throw new RuntimeException("Got value of type '" +value.getClass().getName() + "' but was expecting '" + byte[].class.getName() + "'.");
+
+		for(final byte[] key : keySet())
+			if (containsKey(key))
+				return true;
+
+		return false;
+	}
+
+	@Override
+	public final int size() {
+		return Long.valueOf(_size.get()).intValue();
+	}
+
+
+	@Override
+	public final byte[] remove(final Object obj_key) {
+		if (obj_key == null)
+			throw new NullPointerException("Unlike an JDK map, persisted map can not accept null keys or null values.");
+
+		if (!(obj_key instanceof byte[]))
+			throw new RuntimeException("Got value of type '" + obj_key.getClass().getName() + "' but was expecting '" + byte[].class.getName() + "'.");
+
+		final byte[] key = (byte[]) obj_key;
+		final int index = getIndex(key);
+		final long pointer = index_list.get(index);
+		if (pointer < 0)
+			return null;
+
+		Entry entry = null;
+		long next = pointer;
+		while((entry = getEntry(next)) != null){
+			entry.lock();
+			try{
+				if (arrayEquals(key, entry.getKey())){
+					buffers.remove(next);
+					final byte[] result = entry.getValue();
+					final long prev = entry.getPreviousIndex();
+					final long nxt = entry.getNextIndex();
+					if (prev < 0){
+						if (nxt < 0){
+							index_list.set(index, Long.valueOf(-1));
+						}else{
+							final Entry nextEntry = getEntry(nxt);
+							nextEntry.lock();
+							try{
+								nextEntry.setPrevious(prev);
+							}finally{
+								nextEntry.unlock();
+							}
+							index_list.set(index, nxt);
+						}
+					}else{
+						if (nxt < 0){
+							final Entry prevEntry = getEntry(prev);
+							prevEntry.lock();
+							try{
+								prevEntry.setNext(nxt);
+							}finally{
+								prevEntry.unlock();
+							}
+						}else{
+							final Entry prevEntry = getEntry(prev);
+							final Entry nextEntry = getEntry(nxt);
+							prevEntry.lock();
+							try{
+								prevEntry.setNext(nxt);
+							}finally{
+								prevEntry.unlock();
+							}
+							nextEntry.lock();
+							try{
+								nextEntry.setPrevious(prev);
+							}finally{
+								nextEntry.unlock();
+							}
+						}
+					}
+					incrementSize(-1);
+					return result;
+				}else
+					next = entry.getNextIndex();
+			}finally{
+				entry.unlock();
+			}
+		}
+		return null;
+	}
+
+	@Override
+	public final void putAll(final Map<? extends byte[], ? extends byte[]> m) {
+		for(final byte[] key : m.keySet())
+			this.put(key, m.get(key));
+	}
+
+	@Override
+	public final void clear() {
+		this.setOffset(new Integer(Long.BYTES + Long.BYTES).longValue());
+		this.setSize(0);
+
+		for (long i = 0; i < capacity; i++)
+			index_list.set(i, (long) -1);
+	}
+
+	@Override
+	public final Set<byte[]> keySet() {
+		return new Set<byte[]>() {
+			@SuppressWarnings("unchecked")
+			@Override
+			public final <T> T[] toArray(final T[] a) {
+				final Iterator<byte[]> iter = this.iterator();
+				int index = 0, len = a.length;
+				while(iter.hasNext()){
+					if (index < len){
+						a[index] = (T) iter.next();
+					}else{
+						return a;
+					}
+					index++;
+				}
+				return a;
+			}
+			@Override
+			public final Object[] toArray() {
+				final byte[][] arr = new byte[this.size()][];
+				return toArray(arr);
+			}
+			@Override
+			public final int size() {
+				return ByteArrayMap.this.size();
+			}
+			@Override
+			public final boolean retainAll(final Collection<?> c) {
+				final HashSet<Object> set = new HashSet<Object>();
+				set.addAll(c);
+				final ArrayList<byte[]> toRemove = new ArrayList<byte[]>();
+
+				for(final byte[] o : this)
+					if (!set.contains(o))
+						toRemove.add(o);
+
+				return this.removeAll(toRemove);
+			}
+			@Override
+			public final boolean removeAll(final Collection<?> c) {
+				boolean result = false;
+				for(final Object o : c){
+					if (remove(o)){
+						result = true;
+					}
+				}
+				return result;
+			}
+			@Override
+			public final boolean remove(final Object o) {
+				if (o == null)
+					return false;
+
+				if (o instanceof byte[])
+					if (ByteArrayMap.this.remove((byte[])o) == null)
+						return false;
+					else
+						return true;
+
+				return false;
+			}
+
+			@Override
+			public final Iterator<byte[]> iterator() {
+				return new Iterator<byte[]>() {
+					private final Iterator<Long> iter = ByteArrayMap.this.index_list.iterator();
+					private volatile Entry currentEntry = null;
+					
+					@Override
+					public final byte[] next() {
+						Entry entry = currentEntry;
+						if (entry == null){
+							if (hasNext()){
+								entry = currentEntry;
+								if (entry == null){
+									return null;
+								}else{
+									entry.lock();
+									try{
+										final long nxt = entry.getNextIndex();
+										if (nxt < 0){
+											currentEntry = null;
+										}else{
+											currentEntry = ByteArrayMap.this.getEntry(nxt);
+										}
+										return entry.getKey();
+									}finally{
+										entry.unlock();
+									}
+								}
+							}
+						}else{
+							entry.lock();
+							try{
+								final long nxt = entry.getNextIndex();
+								if (nxt < 0){
+									currentEntry = null;
+								}else{
+									currentEntry = ByteArrayMap.this.getEntry(nxt);
+								}
+								return entry.getKey();
+							}finally{
+								entry.unlock();
+							}
+						}
+						return null;
+					}
+					@Override
+					public final boolean hasNext() {
+						if (currentEntry == null){
+							while(iter.hasNext()){
+								final long next = iter.next();
+								if (next >= 0){
+									currentEntry = ByteArrayMap.this.getEntry(next);
+									return true;
+								}
+							}
+							return false;
+						}else{
+							return true;
+						}
+					}
+				};
+			}
+			@Override
+			public final boolean isEmpty() {
+				return ByteArrayMap.this.isEmpty();
+			}
+			@Override
+			public final boolean containsAll(final Collection<?> c) {
+				if (c == null)
+					return false;
+
+				for(final Object o : c)
+					if (!contains(o))
+						return false;
+
+				return true;
+			}
+			@Override
+			public final boolean contains(final Object o) {
+				return ByteArrayMap.this.containsKey(o);
+			}
+			@Override
+			public final void clear() {
+				ByteArrayMap.this.clear();
+			}
+			@Override
+			public final boolean addAll(final Collection<? extends byte[]> c) {
+				throw new RuntimeException("Adding not supported on key set derived from map.");
+			}
+			@Override
+			public final boolean add(final byte[] e) {
+				throw new RuntimeException("Adding not supported on key set derived from map.");
+			}
+		};
+	}
+
+	@Override
+	public final Collection<byte[]> values() {
+		return new Collection<byte[]>() {
+			@SuppressWarnings("unchecked")
+			@Override
+			public final <T> T[] toArray(final T[] a) {
+				int index = 0, len = a.length;
+				for(final java.util.Map.Entry<byte[], byte[]> ent : ByteArrayMap.this.entrySet()){
+					if (index < len){
+						a[index] = (T) ent.getValue();
+					}else{
+						return a;
+					}
+					index++;
+				}
+				return a;
+			}
+			
+			@Override
+			public final Object[] toArray() {
+				final byte[][] res = new byte[this.size()][];
+				return toArray(res);
+			}
+			
+			@Override
+			public final int size() {
+				return ByteArrayMap.this.size();
+			}
+			
+			@Override
+			public final boolean retainAll(final Collection<?> c) {
+				final HashSet<Object> set = new HashSet<Object>();
+				set.addAll(c);
+				final ArrayList<byte[]> toRemove = new ArrayList<byte[]>();
+				
+				for(final java.util.Map.Entry<byte[], byte[]> entry : ByteArrayMap.this.entrySet())
+					if (!set.contains(entry.getValue()))
+						toRemove.add(entry.getKey());
+				
+				return removeAllKeys(toRemove);
+			}
+			private final boolean removeAllKeys(final ArrayList<byte[]> list){
+				boolean result = false;
+				for(final byte[] key : list){
+					if (ByteArrayMap.this.remove(key) != null){
+						result = true;
+					}
+				}
+				return result;
+			}
+			@Override
+			public final boolean removeAll(final Collection<?> c) {
+				final ArrayList<byte[]> toRemove = new ArrayList<byte[]>();
+				
+				for(final java.util.Map.Entry<byte[], byte[]> entry : ByteArrayMap.this.entrySet())
+					if (c.contains(entry.getValue()))
+						toRemove.add(entry.getKey());
+				
+				return removeAllKeys(toRemove);
+			}
+			
+			@Override
+			public final boolean remove(final Object o) {
+				if (o == null)
+					return false;
+				
+				if (o instanceof byte[]){
+					final ArrayList<byte[]> toRemove = new ArrayList<byte[]>();
+					final byte[] key = (byte[])o;
+					
+					for(final java.util.Map.Entry<byte[], byte[]> entry : ByteArrayMap.this.entrySet())
+						if (arrayEquals(key, entry.getValue()))
+							toRemove.add(entry.getKey());
+					
+					return removeAllKeys(toRemove);
+				}
+				return false;
+			}
+			
+			@Override
+			public final Iterator<byte[]> iterator() {
+				return new Iterator<byte[]>() {
+					private final Iterator<java.util.Map.Entry<byte[], byte[]>> iter = ByteArrayMap.this.entrySet().iterator();
+					@Override
+					public final byte[] next() {
+						final java.util.Map.Entry<byte[], byte[]> ent = iter.next();
+						
+						if (ent == null)
+							return null;
+						
+						return ent.getValue();
+					}
+					@Override
+					public final boolean hasNext() {
+						return iter.hasNext();
+					}
+				};
+			}
+			
+			@Override
+			public final boolean isEmpty() {
+				return ByteArrayMap.this.isEmpty();
+			}
+			
+			@Override
+			public final boolean containsAll(final Collection<?> c) {
+				for(final Object o : c)
+					if (!contains(o))
+						return false;
+					
+				return true;
+			}
+			
+			@Override
+			public final boolean contains(final Object o) {
+				if (o == null)
+					return false;
+				
+				if (o instanceof byte[]){
+					final byte[] obj = (byte[]) o;
+					final Iterator<byte[]> iter = iterator();
+					
+					while(iter.hasNext())
+						if (arrayEquals(iter.next(), obj))
+							return true;
+				}
+				return false;
+			}
+			
+			@Override
+			public void clear() {
+				ByteArrayMap.this.clear();
+			}
+			
+			@Override
+			public final boolean addAll(Collection<? extends byte[]> c) {
+				throw new RuntimeException("Adding not supported on value set derived from map.");
+			}
+			
+			@Override
+			public final boolean add(byte[] e) {
+				throw new RuntimeException("Adding not supported on value set derived from map.");
+			}
+		};
+	}
+
+	@Override
+	public Set<java.util.Map.Entry<byte[], byte[]>> entrySet() {
+		return new Set<java.util.Map.Entry<byte[], byte[]>>() {
+			@SuppressWarnings("unchecked")
+			@Override
+			public final <T> T[] toArray(final T[] a) {
+				final Iterator<java.util.Map.Entry<byte[], byte[]>> iter = this.iterator();
+				int index = 0, len = a.length;
+				while(iter.hasNext()){
+					if (index < len){
+						a[index] = (T) iter.next();
+					}else{
+						return a;
+					}
+					index++;
+				}
+				return a;
+			}
+			@Override
+			public final Object[] toArray() {
+				@SuppressWarnings("unchecked")
+				final java.util.Map.Entry<byte[], byte[]>[] arr = new java.util.Map.Entry[this.size()];
+				return toArray(arr);
+			}
+			@Override
+			public final int size() {
+				return ByteArrayMap.this.size();
+			}
+			@Override
+			public final boolean retainAll(final Collection<?> c) {
+				final HashSet<Object> set = new HashSet<Object>();
+				set.addAll(c);
+				final ArrayList<java.util.Map.Entry<byte[], byte[]>> toRemove = new ArrayList<java.util.Map.Entry<byte[], byte[]>>();
+
+				for(final java.util.Map.Entry<byte[], byte[]> o : this)
+					if (!set.contains(o))
+						toRemove.add(o);
+
+				return this.removeAll(toRemove);
+			}
+			@Override
+			public final boolean removeAll(final Collection<?> c) {
+				boolean result = false;
+				for(final Object o : c){
+					if (remove(o)){
+						result = true;
+					}
+				}
+				return result;
+			}
+			@SuppressWarnings("unchecked")
+			@Override
+			public final boolean remove(final Object o) {
+				if (o == null)
+					return false;
+
+				if (o instanceof java.util.Map.Entry)
+					if (ByteArrayMap.this.remove(((java.util.Map.Entry<byte[], byte[]>)o).getKey()) == null)
+						return false;
+					else
+						return true;
+
+				return false;
+			}
+
+			@Override
+			public final Iterator<java.util.Map.Entry<byte[], byte[]>> iterator() {
+				return new Iterator<java.util.Map.Entry<byte[], byte[]>>() {
+					private final Iterator<Long> iter = ByteArrayMap.this.index_list.iterator();
+					private volatile Entry currentEntry = null;
+					
+					@Override
+					public final java.util.Map.Entry<byte[], byte[]> next() {
+						Entry entry = currentEntry;
+						if (entry == null){
+							if (hasNext()){
+								entry = currentEntry;
+								if (entry == null){
+									return null;
+								}else{
+									entry.lock();
+									try{
+										final long nxt = entry.getNextIndex();
+										if (nxt < 0){
+											currentEntry = null;
+										}else{
+											currentEntry = ByteArrayMap.this.getEntry(nxt);
+										}
+										final Entry f_entry = entry;
+										return new java.util.Map.Entry<byte[], byte[]>() {
+											private final byte[] k = f_entry.getKey();
+											@Override
+											public final byte[] setValue(final byte[] value) {
+												return ByteArrayMap.this.put(k, value);
+											}
+											
+											@Override
+											public final byte[] getValue() {
+												return ByteArrayMap.this.get(k);
+											}
+											
+											@Override
+											public final byte[] getKey() {
+												return k;
+											}
+										};
+									}finally{
+										entry.unlock();
+									}
+								}
+							}
+						}else{
+							entry.lock();
+							try{
+								final long nxt = entry.getNextIndex();
+								if (nxt < 0){
+									currentEntry = null;
+								}else{
+									currentEntry = ByteArrayMap.this.getEntry(nxt);
+								}
+								final Entry f_entry = entry;
+								return new java.util.Map.Entry<byte[], byte[]>() {
+									private final byte[] k = f_entry.getKey();
+									@Override
+									public final byte[] setValue(final byte[] value) {
+										return ByteArrayMap.this.put(k, value);
+									}
+									
+									@Override
+									public final byte[] getValue() {
+										return ByteArrayMap.this.get(k);
+									}
+									
+									@Override
+									public final byte[] getKey() {
+										return k;
+									}
+								};
+							}finally{
+								entry.unlock();
+							}
+						}
+						return null;
+					}
+					@Override
+					public final boolean hasNext() {
+						if (currentEntry == null){
+							while(iter.hasNext()){
+								final long next = iter.next();
+								if (next >= 0){
+									currentEntry = ByteArrayMap.this.getEntry(next);
+									return true;
+								}
+							}
+							return false;
+						}else{
+							return true;
+						}
+					}
+				};
+			}
+			@Override
+			public final boolean isEmpty() {
+				return ByteArrayMap.this.isEmpty();
+			}
+			@Override
+			public final boolean containsAll(final Collection<?> c) {
+				if (c == null)
+					return false;
+
+				for(final Object o : c)
+					if (!contains(o))
+						return false;
+
+				return true;
+			}
+			@Override
+			public final boolean contains(final Object o) {
+				return ByteArrayMap.this.containsKey(o);
+			}
+			@Override
+			public final void clear() {
+				ByteArrayMap.this.clear();
+			}
+			@Override
+			public final boolean addAll(final Collection<? extends java.util.Map.Entry<byte[], byte[]>> c) {
+				throw new RuntimeException("Adding not supported on set derived from map.");
+			}
+			@Override
+			public final boolean add(final java.util.Map.Entry<byte[], byte[]> e) {
+				final byte[] val =e.getValue();
+				final byte[] ret = ByteArrayMap.this.put(e.getKey(), e.getValue());
+				return !arrayEquals(val, ret);
+			}
+		};
+	}
+
+
+
+
+
+
+
+
+
+	//=======================================================================================
+	private static final class Entry{
+		private final CollectionsAccessBuffer buffer;
+		public static final int nextPosition = 0;
+		public static final int prevPosition = Long.BYTES;
+		public static final int sizePosition = prevPosition + Long.BYTES;
+		public static final int keySizePosition = sizePosition + Integer.BYTES;
+		public static final int contentPosition = keySizePosition + Integer.BYTES;
+		private final AtomicLong next;
+		private final AtomicLong previous;
+		private final AtomicInteger valueSize;
+		private final AtomicInteger keySize;
+
+		public static final int calculateSize(final int size){
+			return size + contentPosition;
+		}
+
+		public Entry(final CollectionsAccessBuffer buffer){
+			this.buffer = buffer;
+			this.buffer.lock.lock();
+			try{
+				this.buffer.buffer.position(nextPosition);
+				this.next = new AtomicLong(this.buffer.buffer.getLong());
+				this.previous = new AtomicLong(this.buffer.buffer.getLong());
+				this.valueSize = new AtomicInteger(this.buffer.buffer.getInt());
+				this.keySize = new AtomicInteger(this.buffer.buffer.getInt());
+			}finally{
+				this.buffer.lock.unlock();
+			}
+		}
+		public Entry(final CollectionsAccessBuffer buffer, final byte[] value, final byte[] key){
+			this.buffer = buffer;
+			this.buffer.lock.lock();
+			try{
+				final long nxt = -1;
+				final long prv = -1;
+				final int sz = value.length;
+				final int ksz = key.length;
+				this.buffer.buffer.position(nextPosition);
+				this.buffer.buffer.putLong(nxt);
+				this.buffer.buffer.putLong(prv);
+				this.buffer.buffer.putInt(sz);
+				this.buffer.buffer.putInt(ksz);
+				this.buffer.buffer.put(value);
+				this.buffer.buffer.put(key);
+				this.next = new AtomicLong(nxt);
+				this.previous = new AtomicLong(prv);
+				this.valueSize = new AtomicInteger(sz);
+				this.keySize = new AtomicInteger(ksz);
+			}finally{
+				this.buffer.lock.unlock();
+			}
+		}
+		public final void lock(){
+			this.buffer.lock.lock();
+		}
+		public final void unlock(){
+			this.buffer.lock.unlock();
+		}
+		public final void dispose(){
+			this.buffer.dispose();
+		}
+		public final byte[] getKey(){
+			final byte[] result = new byte[this.keySize.get()];
+			this.buffer.buffer.position(contentPosition + valueSize.get());
+			this.buffer.buffer.get(result);
+			return result;
+		}
+		public final byte[] getValue(){
+			final byte[] result = new byte[this.valueSize.get()];
+			this.buffer.buffer.position(contentPosition);
+			this.buffer.buffer.get(result);
+			return result;
+		}
+		public final void setValue(final byte[] content){
+			final int newSize = content.length;
+			if (newSize == valueSize.get()){
+				this.buffer.buffer.position(contentPosition);
+				this.buffer.buffer.put(content);
+			}else{
+				this.buffer.buffer.position(sizePosition);
+				this.buffer.buffer.putInt(newSize);
+				this.buffer.buffer.position(contentPosition);
+				this.buffer.buffer.put(content);
+			}
+		}
+		public final long setNext(final long index){
+			final long prev = next.getAndSet(index);
+			if (prev != index){
+				this.buffer.buffer.position(nextPosition);
+				this.buffer.buffer.putLong(index);
+			}
+			return prev;
+		}
+		public final long setPrevious(final long index){
+			final long prev = previous.getAndSet(index);
+			if (prev != index){
+				this.buffer.buffer.position(prevPosition);
+				this.buffer.buffer.putLong(index);
+			}
+			return prev;
+		}
+		public final long getNextIndex(){
+			return next.get();
+		}
+		public final long getPreviousIndex(){
+			return previous.get();
+		}
+		@Override
+		public final String toString() {
+			return "Entry [buffer=" + buffer + ", next=" + next + ", previous=" + previous + ", valueSize=" + valueSize
+					+ ", keySize=" + keySize + "]";
+		}
+		@Override
+		public final int hashCode() {
+			final int prime = 31;
+			int result = 1;
+			result = prime * result + ((buffer == null) ? 0 : buffer.hashCode());
+			return result;
+		}
+		@Override
+		public final boolean equals(final Object obj) {
+			if (this == obj)
+				return true;
+			if (obj == null)
+				return false;
+			if (getClass() != obj.getClass())
+				return false;
+			final Entry other = (Entry) obj;
+			if (buffer == null) {
+				if (other.buffer != null)
+					return false;
+			} else if (!buffer.equals(other.buffer))
+				return false;
+			return true;
+		}
+	}
+}
