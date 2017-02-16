@@ -9,14 +9,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 
 import com.gf.persistance.PersistanceFactory;
 import com.gf.persistance.PersistedLongList;
@@ -35,14 +32,11 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 	private final RandomAccessFile ra_file;
 	private final int gc_balance;
 	private final int gc_lower_balance;
-	private final AtomicInteger gc_counter;
 	private final MappedByteBuffer offsetBuffer;
-	private final ReentrantLock offsetLock;
-	private final AtomicLong _offset;
-	private final ConcurrentHashMap<Long, CollectionsAccessBuffer> buffers;
+	private volatile long _offset;
+	private final HashMap<Long, CollectionsAccessBuffer> buffers;
 	private final PersistedLongList<Long> index_list;
-	private final AtomicLong _size;
-	private final ReentrantLock sizeLocker;
+	private volatile long _size;
 	private final MappedByteBuffer sizeBuffer;
 	private final long capacity;
 
@@ -51,10 +45,7 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 		this.storage_file = storage_file;
 		this.gc_balance = gc_balance;
 		this.gc_lower_balance = gc_balance/2;
-		this.gc_counter = new AtomicInteger(0);
-		this.offsetLock = new ReentrantLock(true);
-		this.sizeLocker = new ReentrantLock(true);
-		this.buffers = new ConcurrentHashMap<Long, CollectionsAccessBuffer>();
+		this.buffers = new HashMap<Long, CollectionsAccessBuffer>();
 		this.index_list = PersistanceFactory.createLongList(index_file, storage_file, gc_balance, Long.class);
 
 		if (!storage_file.exists()){
@@ -68,13 +59,13 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 				this.offsetBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, Long.BYTES);
 				this.offsetBuffer.position(0);
 				this.offsetBuffer.putLong(new Integer(Long.BYTES).longValue());
-				this._offset = new AtomicLong(new Integer(Long.BYTES + Long.BYTES).longValue());
+				this._offset = new Integer(Long.BYTES + Long.BYTES).longValue();
 
 				this.sizeBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, Long.BYTES, Long.BYTES);
 			} catch (final Exception e) {
 				throw new RuntimeException(e);
 			}
-			this._size = new AtomicLong(0);
+			this._size = 0;
 
 			for (long i = 0; i < capacity; i++) {
 				index_list.add((long) -1);
@@ -85,10 +76,10 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 				this.ra_file = new RandomAccessFile(storage_file, "rw");
 				this.offsetBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, Long.BYTES);
 				this.offsetBuffer.position(0);
-				this._offset = new AtomicLong(this.offsetBuffer.getLong());
+				this._offset = this.offsetBuffer.getLong();
 				this.sizeBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, Long.BYTES, Long.BYTES);
 				this.sizeBuffer.position(0);
-				this._size = new AtomicLong(sizeBuffer.getLong());
+				this._size = sizeBuffer.getLong();
 			} catch (final Exception e) {
 				throw new RuntimeException(e);
 			}
@@ -96,17 +87,14 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 	}
 
 	private final void setSize(final long size){
-		sizeLocker.lock();
-		try{
-			sizeBuffer.position(0);
-			sizeBuffer.putLong(size);
-		}finally{
-			sizeLocker.unlock();
-		}
+		sizeBuffer.position(0);
+		sizeBuffer.putLong(size);
 	}
+
 	private final long incrementSize(final long delta){
-		final long result = _size.getAndAdd(delta);
-		this.setSize(_size.get());
+		final long result = _size;
+		_size = _size + delta;
+		this.setSize(_size);
 		return result;
 	}
 	private final CollectionsAccessBuffer getBuffer(final long range){
@@ -136,19 +124,14 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 		}
 	}
 	private final long incrementOffset(final long delta){
-		final long result = _offset.getAndAdd(delta);
-		this.setOffset(_offset.get());
+		final long result = _offset;
+		_offset = _offset + delta;
+		this.setOffset(_offset);
 		return result;
 	}
 	private final void setOffset(final long size){
-		offsetLock.lock();
-		try{
-
-			offsetBuffer.position(0);
-			offsetBuffer.putLong(size);
-		}finally{
-			offsetLock.unlock();
-		}
+		offsetBuffer.position(0);
+		offsetBuffer.putLong(size);
 	}
 	private final Object[] allocateBuffer(final int size){
 		final long range = incrementOffset(Integer.valueOf(size).longValue());
@@ -163,8 +146,7 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 		}
 	}
 	private final void gc_if_needed(){
-		if (gc_counter.incrementAndGet() > gc_balance){
-			gc_counter.set(0);
+		if (buffers.size() > gc_balance){
 			final int toRemove = gc_balance - gc_lower_balance;
 			final ArrayList<Long> keys = new ArrayList<Long>(buffers.size());
 
@@ -270,64 +252,49 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 			long next = pointer;
 			while((entry = getEntry(next)) != null){
 				final long prev = next;
-				entry.lock();
-				try{
-					next = entry.getNextIndex();
-					if (arrayEquals(key, entry.getKey())){
-						final byte[] result = entry.getValue();
-						if (value.length <= result.length){
-							entry.setValue(value);
-						}else{
-							buffers.remove(prev);
-							final int key_value_len = value.length + key.length;
-							final Object[] arr = allocateBuffer(Entry.calculateSize(key_value_len));
-							final CollectionsAccessBuffer buf = (CollectionsAccessBuffer) arr[0];
-							final Long newPointer = (Long) arr[1];
-							final Entry newEntry = new Entry(buf, value, key);
-							newEntry.lock();
-							try{
-								if (entry.getPreviousIndex() < 0){
-									if (next < 0){
-										index_list.set(index, newPointer);
-									}else{
-										newEntry.setNext(next);
-										index_list.set(index, newPointer);
-									}
-								}else{
-									newEntry.setPrevious(entry.getPreviousIndex());
-									if (next < 0){
-										index_list.set(index, newPointer);
-									}else{
-										newEntry.setNext(next);
-										index_list.set(index, newPointer);
-									}
-								}
-							}finally{
-								newEntry.unlock();
-							}
-							entry.dispose();
-						}
-						return result;
+				next = entry.getNextIndex();
+				if (arrayEquals(key, entry.getKey())){
+					final byte[] result = entry.getValue();
+					if (value.length <= result.length){
+						entry.setValue(value);
 					}else{
-						if (next < 0){
-							final int key_value_len = value.length + key.length;
-							final Object[] arr = allocateBuffer(Entry.calculateSize(key_value_len));
-							final CollectionsAccessBuffer buf = (CollectionsAccessBuffer) arr[0];
-							final Long newPointer = (Long) arr[1];
-							final Entry newEntry = new Entry(buf, value, key);
-							newEntry.lock();
-							try{
-								entry.setNext(newPointer);
-								newEntry.setPrevious(prev);
-								this.incrementSize(1);
-							}finally{
-								newEntry.unlock();
+						buffers.remove(prev);
+						final int key_value_len = value.length + key.length;
+						final Object[] arr = allocateBuffer(Entry.calculateSize(key_value_len));
+						final CollectionsAccessBuffer buf = (CollectionsAccessBuffer) arr[0];
+						final Long newPointer = (Long) arr[1];
+						final Entry newEntry = new Entry(buf, value, key);
+						if (entry.getPreviousIndex() < 0){
+							if (next < 0){
+								index_list.set(index, newPointer);
+							}else{
+								newEntry.setNext(next);
+								index_list.set(index, newPointer);
 							}
-							return null;
+						}else{
+							newEntry.setPrevious(entry.getPreviousIndex());
+							if (next < 0){
+								index_list.set(index, newPointer);
+							}else{
+								newEntry.setNext(next);
+								index_list.set(index, newPointer);
+							}
 						}
+						entry.dispose();
 					}
-				}finally{
-					entry.unlock();
+					return result;
+				}else{
+					if (next < 0){
+						final int key_value_len = value.length + key.length;
+						final Object[] arr = allocateBuffer(Entry.calculateSize(key_value_len));
+						final CollectionsAccessBuffer buf = (CollectionsAccessBuffer) arr[0];
+						final Long newPointer = (Long) arr[1];
+						final Entry newEntry = new Entry(buf, value, key);
+						entry.setNext(newPointer);
+						newEntry.setPrevious(prev);
+						this.incrementSize(1);
+						return null;
+					}
 				}
 			}
 			throw new RuntimeException("Inconsistent index. While range was positive, no key was found.");
@@ -350,15 +317,10 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 		Entry entry = null;
 		long next = pointer;
 		while((entry = getEntry(next)) != null){
-			entry.lock();
-			try{
-				if (arrayEquals(key, entry.getKey()))
-					return entry.getValue();
-				else
-					next = entry.getNextIndex();
-			}finally{
-				entry.unlock();
-			}
+			if (arrayEquals(key, entry.getKey()))
+				return entry.getValue();
+			else
+				next = entry.getNextIndex();
 		}
 		return null;
 	}
@@ -390,15 +352,10 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 		Entry entry = null;
 		long next = pointer;
 		while((entry = getEntry(next)) != null){
-			entry.lock();
-			try{
-				if (arrayEquals(key, entry.getKey()))
-					return true;
-				else
-					next = entry.getNextIndex();
-			}finally{
-				entry.unlock();
-			}
+			if (arrayEquals(key, entry.getKey()))
+				return true;
+			else
+				next = entry.getNextIndex();
 		}
 		return false;
 	}
@@ -420,7 +377,7 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 
 	@Override
 	public final int size() {
-		return Long.valueOf(_size.get()).intValue();
+		return Long.valueOf(_size).intValue();
 	}
 
 
@@ -441,59 +398,34 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 		Entry entry = null;
 		long next = pointer;
 		while((entry = getEntry(next)) != null){
-			entry.lock();
-			try{
-				if (arrayEquals(key, entry.getKey())){
-					buffers.remove(next);
-					final byte[] result = entry.getValue();
-					final long prev = entry.getPreviousIndex();
-					final long nxt = entry.getNextIndex();
-					if (prev < 0){
-						if (nxt < 0){
-							index_list.set(index, Long.valueOf(-1));
-						}else{
-							final Entry nextEntry = getEntry(nxt);
-							nextEntry.lock();
-							try{
-								nextEntry.setPrevious(prev);
-							}finally{
-								nextEntry.unlock();
-							}
-							index_list.set(index, nxt);
-						}
+			if (arrayEquals(key, entry.getKey())){
+				buffers.remove(next);
+				final byte[] result = entry.getValue();
+				final long prev = entry.getPreviousIndex();
+				final long nxt = entry.getNextIndex();
+				if (prev < 0){
+					if (nxt < 0){
+						index_list.set(index, Long.valueOf(-1));
 					}else{
-						if (nxt < 0){
-							final Entry prevEntry = getEntry(prev);
-							prevEntry.lock();
-							try{
-								prevEntry.setNext(nxt);
-							}finally{
-								prevEntry.unlock();
-							}
-						}else{
-							final Entry prevEntry = getEntry(prev);
-							final Entry nextEntry = getEntry(nxt);
-							prevEntry.lock();
-							try{
-								prevEntry.setNext(nxt);
-							}finally{
-								prevEntry.unlock();
-							}
-							nextEntry.lock();
-							try{
-								nextEntry.setPrevious(prev);
-							}finally{
-								nextEntry.unlock();
-							}
-						}
+						final Entry nextEntry = getEntry(nxt);
+						nextEntry.setPrevious(prev);
+						index_list.set(index, nxt);
 					}
-					incrementSize(-1);
-					return result;
-				}else
-					next = entry.getNextIndex();
-			}finally{
-				entry.unlock();
-			}
+				}else{
+					if (nxt < 0){
+						final Entry prevEntry = getEntry(prev);
+						prevEntry.setNext(nxt);
+					}else{
+						final Entry prevEntry = getEntry(prev);
+						final Entry nextEntry = getEntry(nxt);
+						prevEntry.setNext(nxt);
+						nextEntry.setPrevious(prev);
+					}
+				}
+				incrementSize(-1);
+				return result;
+			}else
+				next = entry.getNextIndex();
 		}
 		return null;
 	}
@@ -581,7 +513,7 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 				return new Iterator<byte[]>() {
 					private final Iterator<Long> iter = ByteArrayMap.this.index_list.iterator();
 					private volatile Entry currentEntry = null;
-					
+
 					@Override
 					public final byte[] next() {
 						Entry entry = currentEntry;
@@ -591,33 +523,23 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 								if (entry == null){
 									return null;
 								}else{
-									entry.lock();
-									try{
-										final long nxt = entry.getNextIndex();
-										if (nxt < 0){
-											currentEntry = null;
-										}else{
-											currentEntry = ByteArrayMap.this.getEntry(nxt);
-										}
-										return entry.getKey();
-									}finally{
-										entry.unlock();
+									final long nxt = entry.getNextIndex();
+									if (nxt < 0){
+										currentEntry = null;
+									}else{
+										currentEntry = ByteArrayMap.this.getEntry(nxt);
 									}
+									return entry.getKey();
 								}
 							}
 						}else{
-							entry.lock();
-							try{
-								final long nxt = entry.getNextIndex();
-								if (nxt < 0){
-									currentEntry = null;
-								}else{
-									currentEntry = ByteArrayMap.this.getEntry(nxt);
-								}
-								return entry.getKey();
-							}finally{
-								entry.unlock();
+							final long nxt = entry.getNextIndex();
+							if (nxt < 0){
+								currentEntry = null;
+							}else{
+								currentEntry = ByteArrayMap.this.getEntry(nxt);
 							}
+							return entry.getKey();
 						}
 						return null;
 					}
@@ -689,28 +611,28 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 				}
 				return a;
 			}
-			
+
 			@Override
 			public final Object[] toArray() {
 				final byte[][] res = new byte[this.size()][];
 				return toArray(res);
 			}
-			
+
 			@Override
 			public final int size() {
 				return ByteArrayMap.this.size();
 			}
-			
+
 			@Override
 			public final boolean retainAll(final Collection<?> c) {
 				final HashSet<Object> set = new HashSet<Object>();
 				set.addAll(c);
 				final ArrayList<byte[]> toRemove = new ArrayList<byte[]>();
-				
+
 				for(final java.util.Map.Entry<byte[], byte[]> entry : ByteArrayMap.this.entrySet())
 					if (!set.contains(entry.getValue()))
 						toRemove.add(entry.getKey());
-				
+
 				return removeAllKeys(toRemove);
 			}
 			private final boolean removeAllKeys(final ArrayList<byte[]> list){
@@ -725,32 +647,32 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 			@Override
 			public final boolean removeAll(final Collection<?> c) {
 				final ArrayList<byte[]> toRemove = new ArrayList<byte[]>();
-				
+
 				for(final java.util.Map.Entry<byte[], byte[]> entry : ByteArrayMap.this.entrySet())
 					if (c.contains(entry.getValue()))
 						toRemove.add(entry.getKey());
-				
+
 				return removeAllKeys(toRemove);
 			}
-			
+
 			@Override
 			public final boolean remove(final Object o) {
 				if (o == null)
 					return false;
-				
+
 				if (o instanceof byte[]){
 					final ArrayList<byte[]> toRemove = new ArrayList<byte[]>();
 					final byte[] key = (byte[])o;
-					
+
 					for(final java.util.Map.Entry<byte[], byte[]> entry : ByteArrayMap.this.entrySet())
 						if (arrayEquals(key, entry.getValue()))
 							toRemove.add(entry.getKey());
-					
+
 					return removeAllKeys(toRemove);
 				}
 				return false;
 			}
-			
+
 			@Override
 			public final Iterator<byte[]> iterator() {
 				return new Iterator<byte[]>() {
@@ -758,10 +680,10 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 					@Override
 					public final byte[] next() {
 						final java.util.Map.Entry<byte[], byte[]> ent = iter.next();
-						
+
 						if (ent == null)
 							return null;
-						
+
 						return ent.getValue();
 					}
 					@Override
@@ -770,47 +692,47 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 					}
 				};
 			}
-			
+
 			@Override
 			public final boolean isEmpty() {
 				return ByteArrayMap.this.isEmpty();
 			}
-			
+
 			@Override
 			public final boolean containsAll(final Collection<?> c) {
 				for(final Object o : c)
 					if (!contains(o))
 						return false;
-					
+
 				return true;
 			}
-			
+
 			@Override
 			public final boolean contains(final Object o) {
 				if (o == null)
 					return false;
-				
+
 				if (o instanceof byte[]){
 					final byte[] obj = (byte[]) o;
 					final Iterator<byte[]> iter = iterator();
-					
+
 					while(iter.hasNext())
 						if (arrayEquals(iter.next(), obj))
 							return true;
 				}
 				return false;
 			}
-			
+
 			@Override
 			public void clear() {
 				ByteArrayMap.this.clear();
 			}
-			
+
 			@Override
 			public final boolean addAll(Collection<? extends byte[]> c) {
 				throw new RuntimeException("Adding not supported on value set derived from map.");
 			}
-			
+
 			@Override
 			public final boolean add(byte[] e) {
 				throw new RuntimeException("Adding not supported on value set derived from map.");
@@ -888,7 +810,7 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 				return new Iterator<java.util.Map.Entry<byte[], byte[]>>() {
 					private final Iterator<Long> iter = ByteArrayMap.this.index_list.iterator();
 					private volatile Entry currentEntry = null;
-					
+
 					@Override
 					public final java.util.Map.Entry<byte[], byte[]> next() {
 						Entry entry = currentEntry;
@@ -898,67 +820,57 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 								if (entry == null){
 									return null;
 								}else{
-									entry.lock();
-									try{
-										final long nxt = entry.getNextIndex();
-										if (nxt < 0){
-											currentEntry = null;
-										}else{
-											currentEntry = ByteArrayMap.this.getEntry(nxt);
-										}
-										final Entry f_entry = entry;
-										return new java.util.Map.Entry<byte[], byte[]>() {
-											private final byte[] k = f_entry.getKey();
-											@Override
-											public final byte[] setValue(final byte[] value) {
-												return ByteArrayMap.this.put(k, value);
-											}
-											
-											@Override
-											public final byte[] getValue() {
-												return ByteArrayMap.this.get(k);
-											}
-											
-											@Override
-											public final byte[] getKey() {
-												return k;
-											}
-										};
-									}finally{
-										entry.unlock();
+									final long nxt = entry.getNextIndex();
+									if (nxt < 0){
+										currentEntry = null;
+									}else{
+										currentEntry = ByteArrayMap.this.getEntry(nxt);
 									}
+									final Entry f_entry = entry;
+									return new java.util.Map.Entry<byte[], byte[]>() {
+										private final byte[] k = f_entry.getKey();
+										@Override
+										public final byte[] setValue(final byte[] value) {
+											return ByteArrayMap.this.put(k, value);
+										}
+
+										@Override
+										public final byte[] getValue() {
+											return ByteArrayMap.this.get(k);
+										}
+
+										@Override
+										public final byte[] getKey() {
+											return k;
+										}
+									};
 								}
 							}
 						}else{
-							entry.lock();
-							try{
-								final long nxt = entry.getNextIndex();
-								if (nxt < 0){
-									currentEntry = null;
-								}else{
-									currentEntry = ByteArrayMap.this.getEntry(nxt);
-								}
-								final Entry f_entry = entry;
-								return new java.util.Map.Entry<byte[], byte[]>() {
-									private final byte[] k = f_entry.getKey();
-									@Override
-									public final byte[] setValue(final byte[] value) {
-										return ByteArrayMap.this.put(k, value);
-									}
-									
-									@Override
-									public final byte[] getValue() {
-										return ByteArrayMap.this.get(k);
-									}
-									
-									@Override
-									public final byte[] getKey() {
-										return k;
-									}
-								};
-							}finally{
-								entry.unlock();
+							final long nxt = entry.getNextIndex();
+							if (nxt < 0){
+								currentEntry = null;
+							}else{
+								currentEntry = ByteArrayMap.this.getEntry(nxt);
 							}
+							final Entry f_entry = entry;
+							return new java.util.Map.Entry<byte[], byte[]>() {
+								private final byte[] k = f_entry.getKey();
+								@Override
+								public final byte[] setValue(final byte[] value) {
+									return ByteArrayMap.this.put(k, value);
+								}
+
+								@Override
+								public final byte[] getValue() {
+									return ByteArrayMap.this.get(k);
+								}
+
+								@Override
+								public final byte[] getKey() {
+									return k;
+								}
+							};
 						}
 						return null;
 					}
@@ -1031,75 +943,61 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 		public static final int sizePosition = prevPosition + Long.BYTES;
 		public static final int keySizePosition = sizePosition + Integer.BYTES;
 		public static final int contentPosition = keySizePosition + Integer.BYTES;
-		private final AtomicLong next;
-		private final AtomicLong previous;
-		private final AtomicInteger valueSize;
-		private final AtomicInteger keySize;
+		private volatile long next;
+		private volatile long previous;
+		private volatile int valueSize;
+		private volatile int keySize;
 
 		public static final int calculateSize(final int size){
 			return size + contentPosition;
 		}
 
+
 		public Entry(final CollectionsAccessBuffer buffer){
 			this.buffer = buffer;
-			this.buffer.lock.lock();
-			try{
-				this.buffer.buffer.position(nextPosition);
-				this.next = new AtomicLong(this.buffer.buffer.getLong());
-				this.previous = new AtomicLong(this.buffer.buffer.getLong());
-				this.valueSize = new AtomicInteger(this.buffer.buffer.getInt());
-				this.keySize = new AtomicInteger(this.buffer.buffer.getInt());
-			}finally{
-				this.buffer.lock.unlock();
-			}
+			this.buffer.buffer.position(nextPosition);
+			this.next = this.buffer.buffer.getLong();
+			this.previous = this.buffer.buffer.getLong();
+			this.valueSize = this.buffer.buffer.getInt();
+			this.keySize = this.buffer.buffer.getInt();
 		}
 		public Entry(final CollectionsAccessBuffer buffer, final byte[] value, final byte[] key){
 			this.buffer = buffer;
-			this.buffer.lock.lock();
-			try{
-				final long nxt = -1;
-				final long prv = -1;
-				final int sz = value.length;
-				final int ksz = key.length;
-				this.buffer.buffer.position(nextPosition);
-				this.buffer.buffer.putLong(nxt);
-				this.buffer.buffer.putLong(prv);
-				this.buffer.buffer.putInt(sz);
-				this.buffer.buffer.putInt(ksz);
-				this.buffer.buffer.put(value);
-				this.buffer.buffer.put(key);
-				this.next = new AtomicLong(nxt);
-				this.previous = new AtomicLong(prv);
-				this.valueSize = new AtomicInteger(sz);
-				this.keySize = new AtomicInteger(ksz);
-			}finally{
-				this.buffer.lock.unlock();
-			}
+			final long nxt = -1;
+			final long prv = -1;
+			final int sz = value.length;
+			final int ksz = key.length;
+			this.buffer.buffer.position(nextPosition);
+			this.buffer.buffer.putLong(nxt);
+			this.buffer.buffer.putLong(prv);
+			this.buffer.buffer.putInt(sz);
+			this.buffer.buffer.putInt(ksz);
+			this.buffer.buffer.put(value);
+			this.buffer.buffer.put(key);
+			this.next = nxt;
+			this.previous = prv;
+			this.valueSize = sz;
+			this.keySize = ksz;
 		}
-		public final void lock(){
-			this.buffer.lock.lock();
-		}
-		public final void unlock(){
-			this.buffer.lock.unlock();
-		}
+
 		public final void dispose(){
 			this.buffer.dispose();
 		}
 		public final byte[] getKey(){
-			final byte[] result = new byte[this.keySize.get()];
-			this.buffer.buffer.position(contentPosition + valueSize.get());
+			final byte[] result = new byte[this.keySize];
+			this.buffer.buffer.position(contentPosition + valueSize);
 			this.buffer.buffer.get(result);
 			return result;
 		}
 		public final byte[] getValue(){
-			final byte[] result = new byte[this.valueSize.get()];
+			final byte[] result = new byte[this.valueSize];
 			this.buffer.buffer.position(contentPosition);
 			this.buffer.buffer.get(result);
 			return result;
 		}
 		public final void setValue(final byte[] content){
 			final int newSize = content.length;
-			if (newSize == valueSize.get()){
+			if (newSize == valueSize){
 				this.buffer.buffer.position(contentPosition);
 				this.buffer.buffer.put(content);
 			}else{
@@ -1110,7 +1008,8 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 			}
 		}
 		public final long setNext(final long index){
-			final long prev = next.getAndSet(index);
+			final long prev = next;
+			next = index;
 			if (prev != index){
 				this.buffer.buffer.position(nextPosition);
 				this.buffer.buffer.putLong(index);
@@ -1118,7 +1017,8 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 			return prev;
 		}
 		public final long setPrevious(final long index){
-			final long prev = previous.getAndSet(index);
+			final long prev = previous;
+			previous = index;
 			if (prev != index){
 				this.buffer.buffer.position(prevPosition);
 				this.buffer.buffer.putLong(index);
@@ -1126,10 +1026,10 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 			return prev;
 		}
 		public final long getNextIndex(){
-			return next.get();
+			return next;
 		}
 		public final long getPreviousIndex(){
-			return previous.get();
+			return previous;
 		}
 		@Override
 		public final String toString() {

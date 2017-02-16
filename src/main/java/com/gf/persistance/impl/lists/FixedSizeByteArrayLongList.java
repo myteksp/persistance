@@ -8,13 +8,10 @@ import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 
 import com.gf.persistance.LongListIterator;
 import com.gf.persistance.PersistedLongList;
@@ -25,24 +22,20 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 
 	private final File file;
 	private final RandomAccessFile ra_file;
-	private final ReentrantLock sizeLocker;
 	private final MappedByteBuffer sizeBuffer;
-	private final ConcurrentHashMap<Long, CollectionsAccessBuffer> buffers;
-	private final AtomicInteger gc_counter;
+	private final HashMap<Long, CollectionsAccessBuffer> buffers;
 	private final int gc_balance;
 	private final int gc_lower_balance;
-	private final AtomicLong _size;
+	private volatile long _size;
 
 	public FixedSizeByteArrayLongList(final File file, final int entitySize, final int gc_balance){
 		if (file == null)
 			throw new NullPointerException();
 
 		this.file = file;
-		this.sizeLocker = new ReentrantLock(true);
 		this.gc_balance = gc_balance;
 		this.gc_lower_balance = gc_balance/2;
-		this.buffers = new ConcurrentHashMap<Long, CollectionsAccessBuffer>();
-		this.gc_counter = new AtomicInteger(0);
+		this.buffers = new HashMap<Long, CollectionsAccessBuffer>();
 		this.ENTRY_SIZE = entitySize;
 
 		if (!file.exists()){
@@ -57,14 +50,14 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 			} catch (final Exception e) {
 				throw new RuntimeException(e);
 			}
-			this._size = new AtomicLong(0);
+			this._size = 0;
 			setSize(Long.valueOf(0).longValue());
 		}else{
 			try {
 				this.ra_file = new RandomAccessFile(file, "rw");
 				this.sizeBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, Long.BYTES);
 				this.sizeBuffer.position(0);
-				this._size = new AtomicLong(sizeBuffer.getLong());
+				this._size = sizeBuffer.getLong();
 			} catch (final Exception e) {
 				throw new RuntimeException(e);
 			}
@@ -95,8 +88,7 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 	}
 
 	private final void gc_if_needed(){
-		if (gc_counter.incrementAndGet() > gc_balance){
-			gc_counter.set(0);
+		if (buffers.size() > gc_balance){
 			final int toRemove = gc_balance - gc_lower_balance;
 			final ArrayList<Long> keys = new ArrayList<Long>(buffers.size());
 
@@ -123,19 +115,15 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 	}
 
 	private final void setSize(final Long size){
-		_size.set(size);
-		sizeLocker.lock();
-		try{
-			sizeBuffer.position(0);
-			sizeBuffer.putLong(size);
-		}finally{
-			sizeLocker.unlock();
-		}
+		_size = size;
+		sizeBuffer.position(0);
+		sizeBuffer.putLong(size);
 	}
 
 	private final long incrementSize(final long delta){
-		final long result = _size.getAndAdd(delta);
-		this.setSize(_size.get());
+		final long result = _size;
+		_size = _size + delta;
+		this.setSize(_size);
 		return result;
 	}
 
@@ -191,12 +179,12 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 
 	@Override
 	public final long size() {
-		return _size.get();
+		return _size;
 	}
 
 	@Override
 	public final boolean isEmpty() {
-		return _size.get() == 0;
+		return _size == 0;
 	}
 
 	@Override
@@ -217,7 +205,7 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 	@Override
 	public final Iterator<byte[]> iterator() {
 		return new Iterator<byte[]>() {
-			private final AtomicLong index = new AtomicLong(0);
+			private volatile long index = 0;
 			private volatile byte[] next = null;
 
 			@Override
@@ -225,15 +213,17 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 				if (next != null){
 					final byte[] res = next;
 					next = null;
-					index.incrementAndGet();
+					index++;
 					return res;
 				}
-				return get(index.getAndIncrement());
+				final long g = index;
+				index++;
+				return get(g);
 			}
 
 			@Override
 			public final boolean hasNext() {
-				final long i = index.get();
+				final long i = index;
 				final boolean result = i < size();
 				if (result)
 					if (next == null)
@@ -266,13 +256,8 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 	@Override
 	public final boolean add(final byte[] e) {
 		final CollectionsAccessBuffer buf = getBuffer(incrementSize(1));
-		buf.lock.lock();
-		try{
-			buf.buffer.position(0);
-			buf.buffer.put(e);
-		}finally{
-			buf.lock.unlock();
-		}
+		buf.buffer.position(0);
+		buf.buffer.put(e);
 		return true;
 	}
 
@@ -368,13 +353,8 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 		if (index < size){
 			final CollectionsAccessBuffer buf = getBuffer(index);
 			final byte[] res = new byte[ENTRY_SIZE];
-			buf.lock.lock();
-			try{
-				buf.buffer.position(0);
-				buf.buffer.get(res);
-			}finally{
-				buf.lock.unlock();
-			}
+			buf.buffer.position(0);
+			buf.buffer.get(res);
 			return res;
 		}
 		throw new ArrayIndexOutOfBoundsException("Trying to access index " + index + " in a list of length of " + size);
@@ -386,28 +366,18 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 		if (index < size){
 			final CollectionsAccessBuffer buf = getBuffer(index);
 			final byte[] res = new byte[ENTRY_SIZE];
-			buf.lock.lock();
-			try{
-				buf.buffer.position(0);
-				buf.buffer.get(res);
-				buf.buffer.position(0);
-				buf.buffer.put(element);
-				return res;
-			}finally{
-				buf.lock.unlock();
-			}
+			buf.buffer.position(0);
+			buf.buffer.get(res);
+			buf.buffer.position(0);
+			buf.buffer.put(element);
+			return res;
 		}else{
 			final long newSize = index + 1;
 			setSize(newSize);
 			for(long i = size; i < newSize; i++){
 				final CollectionsAccessBuffer buf = getBuffer(i);
-				buf.lock.lock();
-				try{
-					buf.buffer.position(0);
-					buf.buffer.put(element);
-				}finally{
-					buf.lock.unlock();
-				}
+				buf.buffer.position(0);
+				buf.buffer.put(element);
 			}
 			return null;
 		}
@@ -463,42 +433,45 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 	@Override
 	public final LongListIterator<byte[]> listIterator() {
 		return new LongListIterator<byte[]>() {
-			private final AtomicLong currentIndex = new AtomicLong(0);
+			private volatile long currentIndex = 0;
 			@Override
 			public final void set(final byte[] e) {
-				FixedSizeByteArrayLongList.this.set(currentIndex.get(), e);
+				FixedSizeByteArrayLongList.this.set(currentIndex, e);
 			}
 			@Override
 			public final void remove() {
-				FixedSizeByteArrayLongList.this.remove(currentIndex.get());
+				FixedSizeByteArrayLongList.this.remove(currentIndex);
 			}
 			@Override
 			public final long previousIndex() {
-				return currentIndex.get() - 1;
+				return currentIndex - 1;
 			}
 			@Override
 			public final byte[] previous() {
-				return FixedSizeByteArrayLongList.this.get(currentIndex.decrementAndGet());
+				currentIndex--;
+				return FixedSizeByteArrayLongList.this.get(currentIndex);
 			}
 			@Override
 			public final long nextIndex() {
-				return currentIndex.get() + 1;
+				return currentIndex + 1;
 			}
 			@Override
 			public final byte[] next() {
-				return FixedSizeByteArrayLongList.this.get(currentIndex.incrementAndGet());
+				currentIndex++;
+				return FixedSizeByteArrayLongList.this.get(currentIndex);
 			}
 			@Override
 			public final boolean hasPrevious() {
-				return currentIndex.get() > 0;
+				return currentIndex > 0;
 			}
 			@Override
 			public final boolean hasNext() {
-				return currentIndex.get() < (FixedSizeByteArrayLongList.this.size() - 1);
+				return currentIndex < (FixedSizeByteArrayLongList.this.size() - 1);
 			}
 			@Override
 			public final void add(final byte[] e) {
-				FixedSizeByteArrayLongList.this.add(currentIndex.getAndIncrement(), e);
+				FixedSizeByteArrayLongList.this.add(currentIndex, e);
+				currentIndex++;
 			}
 		};
 	}
@@ -506,42 +479,45 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 	@Override
 	public final LongListIterator<byte[]> listIterator(final long index) {
 		return new LongListIterator<byte[]>() {
-			private final AtomicLong currentIndex = new AtomicLong(index);
+			private volatile long currentIndex = index;
 			@Override
 			public final void set(final byte[] e) {
-				FixedSizeByteArrayLongList.this.set(currentIndex.get(), e);
+				FixedSizeByteArrayLongList.this.set(currentIndex, e);
 			}
 			@Override
 			public final void remove() {
-				FixedSizeByteArrayLongList.this.remove(currentIndex.get());
+				FixedSizeByteArrayLongList.this.remove(currentIndex);
 			}
 			@Override
 			public final long previousIndex() {
-				return currentIndex.get() - 1;
+				return currentIndex - 1;
 			}
 			@Override
 			public final byte[] previous() {
-				return FixedSizeByteArrayLongList.this.get(currentIndex.decrementAndGet());
+				currentIndex--;
+				return FixedSizeByteArrayLongList.this.get(currentIndex);
 			}
 			@Override
 			public final long nextIndex() {
-				return currentIndex.get() + 1;
+				return currentIndex + 1;
 			}
 			@Override
 			public final byte[] next() {
-				return FixedSizeByteArrayLongList.this.get(currentIndex.incrementAndGet());
+				currentIndex++;
+				return FixedSizeByteArrayLongList.this.get(currentIndex);
 			}
 			@Override
 			public final boolean hasPrevious() {
-				return currentIndex.get() > 0;
+				return currentIndex > 0;
 			}
 			@Override
 			public final boolean hasNext() {
-				return currentIndex.get() < (FixedSizeByteArrayLongList.this.size() - 1);
+				return currentIndex < (FixedSizeByteArrayLongList.this.size() - 1);
 			}
 			@Override
 			public final void add(final byte[] e) {
-				FixedSizeByteArrayLongList.this.add(currentIndex.getAndIncrement(), e);
+				FixedSizeByteArrayLongList.this.add(currentIndex, e);
+				currentIndex++;
 			}
 		};
 	}

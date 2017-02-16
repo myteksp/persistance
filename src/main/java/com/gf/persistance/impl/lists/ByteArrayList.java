@@ -9,13 +9,11 @@ import java.nio.channels.FileChannel;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantLock;
 
 import com.gf.persistance.PersistedList;
 import com.gf.persistance.impl.CollectionsAccessBuffer;
@@ -26,16 +24,14 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 	private final RandomAccessFile ra_file;
 	private final int gc_balance;
 	private final int gc_lower_balance;
-	private final ConcurrentHashMap<TripleLong, CollectionsAccessBuffer> buffers;
-	private final AtomicInteger gc_counter;
+	private final HashMap<TripleLong, CollectionsAccessBuffer> buffers;
 	private final MappedByteBuffer offsetBuffer;
-	private final ReentrantLock offsetLock;
 
 	public ByteArrayList(final File index_file, final File storage_file){
 		this(index_file, storage_file, 100);
 	}
-	
-	
+
+
 	private static final Codec<TripleLong> tripleLongCodec = new Codec<TripleLong>() {
 		@Override
 		public final TripleLong decode(final byte[] bytes) {
@@ -57,9 +53,7 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 		this.storage_file = storage_file;
 		this.gc_balance = gc_balance;
 		this.gc_lower_balance = gc_balance/2;
-		this.buffers = new ConcurrentHashMap<TripleLong, CollectionsAccessBuffer>();
-		this.gc_counter = new AtomicInteger(0);
-		this.offsetLock = new ReentrantLock(true);
+		this.buffers = new HashMap<TripleLong, CollectionsAccessBuffer>();
 
 		if (!storage_file.exists()){
 			try {
@@ -86,8 +80,7 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 	}
 
 	private final void gc_if_needed(){
-		if (gc_counter.incrementAndGet() > gc_balance){
-			gc_counter.set(0);
+		if (buffers.size() > gc_balance){
 			final int toRemove = gc_balance - gc_lower_balance;
 			final ArrayList<TripleLong> keys = new ArrayList<TripleLong>(buffers.size());
 
@@ -157,7 +150,7 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 				}
 			}
 	}
-	
+
 	@Override
 	public final void close() throws IOException {
 		try{ra_file.close();}catch(final Throwable t){}
@@ -199,13 +192,8 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 				final TripleLong range = iter.next();
 				final CollectionsAccessBuffer buf = getBuffer(range);
 				final byte[] res = new byte[buf.size];
-				buf.lock.lock();
-				try{
-					buf.buffer.position(0);
-					buf.buffer.get(res);
-				}finally{
-					buf.lock.unlock();
-				}
+				buf.buffer.position(0);
+				buf.buffer.get(res);
 				return res;
 			}
 			@Override
@@ -238,13 +226,8 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 	public final boolean add(final byte[] e) {
 		final TripleLong range = alocateNewRange(e.length);
 		final CollectionsAccessBuffer buf = getBuffer(range);
-		buf.lock.lock();
-		try{
-			buf.buffer.position(0);
-			buf.buffer.put(e);
-		}finally{
-			buf.lock.unlock();
-		}
+		buf.buffer.position(0);
+		buf.buffer.put(e);
 		index_list.add(range);
 		return true;
 	}
@@ -332,14 +315,9 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 
 	@Override
 	public final void clear() {
-		this.offsetLock.lock();
-		try{
-			this.offsetBuffer.position(0);
-			this.offsetBuffer.putLong(Long.BYTES);
-			this.index_list.clear();
-		}finally{
-			this.offsetLock.unlock();
-		}
+		this.offsetBuffer.position(0);
+		this.offsetBuffer.putLong(Long.BYTES);
+		this.index_list.clear();
 	}
 
 	@Override
@@ -347,29 +325,19 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 		final TripleLong range = index_list.get(index);
 		final CollectionsAccessBuffer buf = getBuffer(range);
 		final byte[] res = new byte[buf.size];
-		buf.lock.lock();
-		try{
-			buf.buffer.position(0);
-			buf.buffer.get(res);
-		}finally{
-			buf.lock.unlock();
-		}
+		buf.buffer.position(0);
+		buf.buffer.get(res);
 		return res;
 	}
 
 	private final TripleLong alocateNewRange(final long size){
 		final long start;
 		final long end;
-		offsetLock.lock();
-		try{
-			offsetBuffer.position(0);
-			start = offsetBuffer.getLong();
-			end = start + size;
-			offsetBuffer.position(0);
-			offsetBuffer.putLong(end);
-		}finally{
-			offsetLock.unlock();
-		}
+		offsetBuffer.position(0);
+		start = offsetBuffer.getLong();
+		end = start + size;
+		offsetBuffer.position(0);
+		offsetBuffer.putLong(end);
 		return new TripleLong(start, end, size);
 	}
 
@@ -380,52 +348,45 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 		final int oldSize = buf.size;
 		final int newSize = element.length;
 		final byte[] res = new byte[oldSize];
-		buf.lock.lock();
-		try{
+
+		buf.buffer.position(0);
+		buf.buffer.get(res);
+		if (newSize == oldSize){
+			//in this case no action need to be performed, since new value is equal in size to the old one.
 			buf.buffer.position(0);
-			buf.buffer.get(res);
-			if (newSize == oldSize){
-				//in this case no action need to be performed, since new value is equal in size to the old one.
-				buf.buffer.position(0);
-				buf.buffer.put(element);
-			}else if (newSize < oldSize){
-				//in this case new value is smaller than the allocated slot, hence could be placed into an existing slot.
+			buf.buffer.put(element);
+		}else if (newSize < oldSize){
+			//in this case new value is smaller than the allocated slot, hence could be placed into an existing slot.
+			buf.buffer.position(0);
+			buf.buffer.put(element);
+			buf.size = newSize;
+			//the only thing to do is to replace the ranges in the index list.
+			final TripleLong new_range = new TripleLong(range.value1, range.value1 + newSize, range.value3);
+			index_list.set(index, new_range);
+			buffers.remove(range);
+		}else{
+			//in this case value is greater than the previous value, but it can still be smaller than originally allocated space.
+			if (newSize <= range.value3){
+				//in this case than value is smaller than the originally allocated space, and so, this case is identical to the (newSize < oldSize)
 				buf.buffer.position(0);
 				buf.buffer.put(element);
 				buf.size = newSize;
-				//the only thing to do is to replace the ranges in the index list.
 				final TripleLong new_range = new TripleLong(range.value1, range.value1 + newSize, range.value3);
 				index_list.set(index, new_range);
 				buffers.remove(range);
 			}else{
-				//in this case value is greater than the previous value, but it can still be smaller than originally allocated space.
-				if (newSize <= range.value3){
-					//in this case than value is smaller than the originally allocated space, and so, this case is identical to the (newSize < oldSize)
-					buf.buffer.position(0);
-					buf.buffer.put(element);
-					buf.size = newSize;
-					final TripleLong new_range = new TripleLong(range.value1, range.value1 + newSize, range.value3);
-					index_list.set(index, new_range);
-					buffers.remove(range);
-				}else{
-					//in this case the new value is greater then the previous and the originally allocated. 
-					//the only option is to allocate a new space and to replace the region in the index.
-					final TripleLong new_range = alocateNewRange(newSize);
-					final CollectionsAccessBuffer new_buf = getBuffer(new_range);
-					new_buf.lock.lock();
-					try{
-						new_buf.buffer.position(0);
-						new_buf.buffer.put(element);
-					}finally{
-						new_buf.lock.unlock();
-					}
-					index_list.set(index, new_range);
-					buffers.remove(range);
-					buf.dispose();
-				}
+				//in this case the new value is greater then the previous and the originally allocated. 
+				//the only option is to allocate a new space and to replace the region in the index.
+				final TripleLong new_range = alocateNewRange(newSize);
+				final CollectionsAccessBuffer new_buf = getBuffer(new_range);
+
+				new_buf.buffer.position(0);
+				new_buf.buffer.put(element);
+
+				index_list.set(index, new_range);
+				buffers.remove(range);
+				buf.dispose();
 			}
-		}finally{
-			buf.lock.unlock();
 		}
 		return res;
 	}
@@ -442,13 +403,8 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 			final CollectionsAccessBuffer buf = buffers.remove(range);
 			if (buf != null){
 				final byte[] res = new byte[buf.size];
-				buf.lock.lock();
-				try{
-					buf.buffer.position(0);
-					buf.buffer.get(res);
-				}finally{
-					buf.lock.unlock();
-				}
+				buf.buffer.position(0);
+				buf.buffer.get(res);
 				return res;
 			}
 		}
@@ -483,42 +439,45 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 	@Override
 	public final ListIterator<byte[]> listIterator() {
 		return new ListIterator<byte[]>() {
-			private final AtomicInteger currentIndex = new AtomicInteger(0);
+			private volatile int currentIndex = 0;
 			@Override
 			public final void set(final byte[] e) {
-				ByteArrayList.this.set(currentIndex.get(), e);
+				ByteArrayList.this.set(currentIndex, e);
 			}
 			@Override
 			public final void remove() {
-				ByteArrayList.this.remove(currentIndex.get());
+				ByteArrayList.this.remove(currentIndex);
 			}
 			@Override
 			public final int previousIndex() {
-				return currentIndex.get() - 1;
+				return currentIndex - 1;
 			}
 			@Override
 			public final byte[] previous() {
-				return ByteArrayList.this.get(currentIndex.decrementAndGet());
+				currentIndex--;
+				return ByteArrayList.this.get(currentIndex);
 			}
 			@Override
 			public final int nextIndex() {
-				return currentIndex.get() + 1;
+				return currentIndex + 1;
 			}
 			@Override
 			public final byte[] next() {
-				return ByteArrayList.this.get(currentIndex.incrementAndGet());
+				currentIndex++;
+				return ByteArrayList.this.get(currentIndex);
 			}
 			@Override
 			public final boolean hasPrevious() {
-				return currentIndex.get() > 0;
+				return currentIndex > 0;
 			}
 			@Override
 			public final boolean hasNext() {
-				return currentIndex.get() < (ByteArrayList.this.size() - 1);
+				return currentIndex < (ByteArrayList.this.size() - 1);
 			}
 			@Override
 			public final void add(final byte[] e) {
-				ByteArrayList.this.add(currentIndex.getAndIncrement(), e);
+				ByteArrayList.this.add(currentIndex, e);
+				currentIndex++;
 			}
 		};
 	}
@@ -526,42 +485,45 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 	@Override
 	public final ListIterator<byte[]> listIterator(final int index) {
 		return new ListIterator<byte[]>() {
-			private final AtomicInteger currentIndex = new AtomicInteger(index);
+			private volatile int currentIndex = index;
 			@Override
 			public final void set(final byte[] e) {
-				ByteArrayList.this.set(currentIndex.get(), e);
+				ByteArrayList.this.set(currentIndex, e);
 			}
 			@Override
 			public final void remove() {
-				ByteArrayList.this.remove(currentIndex.get());
+				ByteArrayList.this.remove(currentIndex);
 			}
 			@Override
 			public final int previousIndex() {
-				return currentIndex.get() - 1;
+				return currentIndex - 1;
 			}
 			@Override
 			public final byte[] previous() {
-				return ByteArrayList.this.get(currentIndex.decrementAndGet());
+				currentIndex--;
+				return ByteArrayList.this.get(currentIndex);
 			}
 			@Override
 			public final int nextIndex() {
-				return currentIndex.get() + 1;
+				return currentIndex + 1;
 			}
 			@Override
 			public final byte[] next() {
-				return ByteArrayList.this.get(currentIndex.incrementAndGet());
+				currentIndex++;
+				return ByteArrayList.this.get(currentIndex);
 			}
 			@Override
 			public final boolean hasPrevious() {
-				return currentIndex.get() > 0;
+				return currentIndex > 0;
 			}
 			@Override
 			public final boolean hasNext() {
-				return currentIndex.get() < (ByteArrayList.this.size() - 1);
+				return currentIndex < (ByteArrayList.this.size() - 1);
 			}
 			@Override
 			public final void add(final byte[] e) {
-				ByteArrayList.this.add(currentIndex.getAndIncrement(), e);
+				ByteArrayList.this.add(currentIndex, e);
+				currentIndex++;
 			}
 		};
 	}
@@ -575,7 +537,7 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 
 		return result;
 	}
-	
+
 	@Override
 	public synchronized final void delete() {
 		try{this.clear();}catch(final Throwable t){}
@@ -583,17 +545,17 @@ public final class ByteArrayList implements PersistedList<byte[]>{
 		try{this.index_list.delete();}catch(final Throwable t){}
 		try{this.storage_file.delete();}catch(final Throwable t){}
 	}
-	
-	
-	
-	
+
+
+
+
 	private static final class TripleLong{
 		public static final int BYTES = Long.BYTES + Long.BYTES + Long.BYTES;
-		
+
 		public final long value1;
 		public final long value2;
 		public final long value3;
-		
+
 		public TripleLong(final long value1, final long value2, final long value3){
 			this.value1 = value1;
 			this.value2 = value2;
