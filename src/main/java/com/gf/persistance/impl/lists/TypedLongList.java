@@ -4,6 +4,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 
@@ -23,6 +24,12 @@ public final class TypedLongList<T> implements PersistedLongList<T>{
 
 		this.engine = engine;
 		this.codec = codec;
+	}
+	
+	private final boolean objEqual(final byte[] a, final byte[] b){
+		final T aa = codec.decode(a);
+		final T bb = codec.decode(b);
+		return aa.equals(bb);
 	}
 
 	@Override
@@ -50,7 +57,12 @@ public final class TypedLongList<T> implements PersistedLongList<T>{
 	@SuppressWarnings("unchecked")
 	@Override
 	public final boolean contains(final Object o) {
-		return engine.contains(codec.encode((T) o));
+		final byte[] a = codec.encode((T) o);
+		for(final byte[] b : engine)
+			if (objEqual(a, b))
+				return true;
+		
+		return false;
 	}
 
 	@Override
@@ -98,18 +110,27 @@ public final class TypedLongList<T> implements PersistedLongList<T>{
 	@SuppressWarnings("unchecked")
 	@Override
 	public final boolean remove(final Object o) {
-		return engine.remove(codec.encode((T) o));
+		final ArrayList<Long> indexes = new ArrayList<Long>();
+		final byte[] a = codec.encode((T) o);
+		for(long i = 0; i < engine.size(); i ++){
+			final byte[] b = engine.get(i);
+			if (objEqual(a, b))
+				indexes.add(i);
+		}
+		
+		for(final long i : indexes)
+			engine.remove(i);
+		
+		return indexes.size() > 0;
 	}
 
-	@SuppressWarnings("unchecked")
 	@Override
 	public final boolean containsAll(final Collection<?> c) {
-		final ArrayList<byte[]> col = new ArrayList<byte[]>(c.size());
-
 		for(final Object o : c)
-			col.add(codec.encode((T) o));
-
-		return engine.containsAll(col);
+			if (!this.contains(o))
+				return false;
+		
+		return true;
 	}
 
 	@SuppressWarnings("unchecked")
@@ -134,26 +155,27 @@ public final class TypedLongList<T> implements PersistedLongList<T>{
 		return engine.addAll(index, col);
 	}
 
-	@SuppressWarnings("unchecked")
 	@Override
 	public final boolean removeAll(final Collection<?> c) {
-		final ArrayList<byte[]> col = new ArrayList<byte[]>(c.size());
-
+		boolean res = false;
 		for(final Object o : c)
-			col.add(codec.encode((T) o));
+			if (this.remove(o))
+				res = true;
 		
-		return engine.removeAll(col);
+		return res;
 	}
 
-	@SuppressWarnings("unchecked")
 	@Override
 	public final boolean retainAll(final Collection<?> c) {
-		final ArrayList<byte[]> col = new ArrayList<byte[]>(c.size());
+		final HashSet<Object> set = new HashSet<Object>();
+		set.addAll(c);
+		final ArrayList<Object> toRemove = new ArrayList<Object>();
 
-		for(final Object o : c)
-			col.add(codec.encode((T) o));
-		
-		return engine.retainAll(col);
+		for(final Object o : this)
+			if (!set.contains(o))
+				toRemove.add(o);
+
+		return this.removeAll(toRemove);
 	}
 
 	@Override
@@ -184,13 +206,24 @@ public final class TypedLongList<T> implements PersistedLongList<T>{
 	@SuppressWarnings("unchecked")
 	@Override
 	public final long indexOf(final Object o) {
-		return engine.indexOf(codec.encode((T) o));
+		final byte[] a = codec.encode((T)o);
+		for(long i = 0; i < engine.size(); i++)
+			if (objEqual(a, engine.get(i)))
+				return i;
+		
+		return -1;
 	}
 
 	@SuppressWarnings("unchecked")
 	@Override
 	public final long lastIndexOf(final Object o) {
-		return engine.lastIndexOf(codec.encode((T) o));
+		final byte[] a = codec.encode((T)o);
+
+		for(long i = size() - 1; i > -1; i--)
+			if (objEqual(a, engine.get(i)))
+				return i;
+		
+		return -1;
 	}
 
 	@Override

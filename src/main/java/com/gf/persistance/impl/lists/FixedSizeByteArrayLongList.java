@@ -126,6 +126,13 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 		this.setSize(_size);
 		return result;
 	}
+	
+	private final long decrementSize(final long delta){
+		final long result = _size;
+		_size = _size - delta;
+		this.setSize(_size);
+		return result;
+	}
 
 	private final CollectionsAccessBuffer getBuffer(final long index){
 		try{
@@ -411,7 +418,7 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 				for (long i = start; i < size; i++) 
 					set(i-1, get(i));
 
-			incrementSize(-1);
+			decrementSize(1);
 			return result;
 		}
 		return null;
