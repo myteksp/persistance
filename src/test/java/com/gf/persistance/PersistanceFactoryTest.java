@@ -115,4 +115,54 @@ public final class PersistanceFactoryTest {
 		
 		map.delete();
 	}
+	
+	@Test
+	public final void sanityStringPersistedLongMapTest() throws IOException{
+		final PersistedLongMap<String, String> map = PersistanceFactory.createLongMap(new File("testLongMapIndex.txt"), new File("testLongMapStore.txt"), 100, 100, String.class, String.class);
+		map.put("key", "value");
+		map.put("key", "value 0");
+		map.put("key1", "value 1");
+		map.put("key2", "value 2");
+		map.put("key3", "value 3");
+		map.put("key4", "value 4");
+		map.put("key5", "value 5");
+		
+		assertEquals(6, map.size());
+		
+		assertEquals("value 0", map.get("key"));
+		assertEquals("value 1", map.get("key1"));
+		assertEquals("value 2", map.get("key2"));
+		assertEquals("value 3", map.get("key3"));
+		assertEquals("value 4", map.get("key4"));
+		assertEquals("value 5", map.get("key5"));
+		
+		assertEquals("value 1", map.remove("key1"));
+		assertEquals("value 3", map.remove("key3"));
+		
+		assertEquals(4, map.size());
+		
+		assertEquals("value 0", map.get("key"));
+		assertEquals("value 2", map.get("key2"));
+		assertEquals("value 4", map.get("key4"));
+		assertEquals("value 5", map.get("key5"));
+		
+		map.put("key1", "value 1");
+		map.put("key3", "value 3");
+		
+		assertEquals(6, map.size());
+		
+		assertEquals("value 0", map.get("key"));
+		assertEquals("value 1", map.get("key1"));
+		assertEquals("value 2", map.get("key2"));
+		assertEquals("value 3", map.get("key3"));
+		assertEquals("value 4", map.get("key4"));
+		assertEquals("value 5", map.get("key5"));
+		
+		for (int i = 0; i < 1000; i++) {
+			map.put("key_" + i, "value " + i);
+		}
+		assertEquals(1006, map.size());
+		
+		map.delete();
+	}
 }

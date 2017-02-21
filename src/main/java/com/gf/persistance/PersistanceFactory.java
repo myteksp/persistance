@@ -11,7 +11,9 @@ import com.gf.persistance.impl.lists.FixedSizeByteArrayList;
 import com.gf.persistance.impl.lists.FixedSizeByteArrayLongList;
 import com.gf.persistance.impl.lists.TypedList;
 import com.gf.persistance.impl.lists.TypedLongList;
+import com.gf.persistance.impl.maps.ByteArrayLongMap;
 import com.gf.persistance.impl.maps.ByteArrayMap;
+import com.gf.persistance.impl.maps.TypedLongMap;
 import com.gf.persistance.impl.maps.TypedMap;
 import com.gf.util.string.JSON;
 
@@ -111,6 +113,15 @@ public final class PersistanceFactory {
 			final Class<K> keyClz, final Class<V> valClz){
 		return new TypedMap<K, V>(new ByteArrayMap(index_file, storage_file, gcBallance, capacity), getCodec(keyClz), getCodec(valClz));
 	}
+	
+	
+	public static final <K,V> PersistedLongMap<K, V> createLongMap(final File index_file, final File storage_file, 
+			final int gcBallance, final long capacity, 
+			final Class<K> keyClz, final Class<V> valClz){
+		return new TypedLongMap<K, V>(new ByteArrayLongMap(index_file, storage_file, gcBallance, capacity), getCodec(keyClz), getCodec(valClz));
+	}
+	
+	
 
 	@SuppressWarnings("unchecked")
 	private static final <E> Codec<E> getCodec(final Class<E> clz){
