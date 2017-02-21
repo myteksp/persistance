@@ -19,6 +19,7 @@ import com.gf.persistance.PersistanceFactory;
 import com.gf.persistance.PersistedLongList;
 import com.gf.persistance.PersistedLongMap;
 import com.gf.persistance.impl.CollectionsAccessBuffer;
+import com.gf.util.string.MacroCompiler;
 
 public final class ByteArrayLongMap implements PersistedLongMap<byte[], byte[]>{
 	private final File storage_file;
@@ -59,9 +60,16 @@ public final class ByteArrayLongMap implements PersistedLongMap<byte[], byte[]>{
 				throw new RuntimeException(e);
 			}
 			this._size = 0;
-
+			
+			final HashMap<String, String> params = new HashMap<String, String>();
 			for (long i = 0; i < capacity; i++) {
 				index_list.add((long) -1);
+				if (i % 10000 == 0){
+					params.put("progress", Long.toString(i));
+					params.put("total", Long.toString(capacity));
+					params.put("percent", Double.toString(((double)i/(double)capacity) * 100.00));
+					System.out.print(MacroCompiler.compile("Initializing long map index file. Done ${progress} out of ${total}. Percent: ${percent}%\r", params));
+				}
 			}
 			setSize(0);
 		}else{
