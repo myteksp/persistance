@@ -66,10 +66,7 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 				throw new RuntimeException(e);
 			}
 			this._size = 0;
-
-			for (long i = 0; i < capacity; i++) {
-				index_list.add((long) -1);
-			}
+			index_list.set(capacity, (long) -1);
 			setSize(0);
 		}else{
 			try {
