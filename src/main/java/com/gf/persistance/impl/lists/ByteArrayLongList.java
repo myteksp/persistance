@@ -354,53 +354,66 @@ public final class ByteArrayLongList implements PersistedLongList<byte[]>{
 		return res;
 	}
 
+
 	@Override
 	public final byte[] set(final long index, final byte[] element) {
-		final TripleLong range = index_list.get(index);
-		final CollectionsAccessBuffer buf = getBuffer(range);
-		final int oldSize = buf.size;
-		final int newSize = element.length;
-		final byte[] res = new byte[oldSize];
-		buf.buffer.position(0);
-		buf.buffer.get(res);
-		if (newSize == oldSize){
-			//in this case no action need to be performed, since new value is equal in size to the old one.
+		final long size = size();
+		if (index < size){
+			final TripleLong range = index_list.get(index);
+			final CollectionsAccessBuffer buf = getBuffer(range);
+			final int oldSize = buf.size;
+			final int newSize = element.length;
+			final byte[] res = new byte[oldSize];
 			buf.buffer.position(0);
-			buf.buffer.put(element);
-		}else if (newSize < oldSize){
-			//in this case new value is smaller than the allocated slot, hence could be placed into an existing slot.
-			buf.buffer.position(0);
-			buf.buffer.put(element);
-			buf.size = newSize;
-			//the only thing to do is to replace the ranges in the index list.
-			final TripleLong new_range = new TripleLong(range.value1, range.value1 + newSize, range.value3);
-			index_list.set(index, new_range);
-			buffers.remove(range);
-		}else{
-			//in this case value is greater than the previous value, but it can still be smaller than originally allocated space.
-			if (newSize <= range.value3){
-				//in this case than value is smaller than the originally allocated space, and so, this case is identical to the (newSize < oldSize)
+			buf.buffer.get(res);
+			if (newSize == oldSize){
+				//in this case no action need to be performed, since new value is equal in size to the old one.
+				buf.buffer.position(0);
+				buf.buffer.put(element);
+			}else if (newSize < oldSize){
+				//in this case new value is smaller than the allocated slot, hence could be placed into an existing slot.
 				buf.buffer.position(0);
 				buf.buffer.put(element);
 				buf.size = newSize;
+				//the only thing to do is to replace the ranges in the index list.
 				final TripleLong new_range = new TripleLong(range.value1, range.value1 + newSize, range.value3);
 				index_list.set(index, new_range);
 				buffers.remove(range);
 			}else{
-				//in this case the new value is greater then the previous and the originally allocated. 
-				//the only option is to allocate a new space and to replace the region in the index.
-				final TripleLong new_range = alocateNewRange(newSize);
-				final CollectionsAccessBuffer new_buf = getBuffer(new_range);
+				//in this case value is greater than the previous value, but it can still be smaller than originally allocated space.
+				if (newSize <= range.value3){
+					//in this case than value is smaller than the originally allocated space, and so, this case is identical to the (newSize < oldSize)
+					buf.buffer.position(0);
+					buf.buffer.put(element);
+					buf.size = newSize;
+					final TripleLong new_range = new TripleLong(range.value1, range.value1 + newSize, range.value3);
+					index_list.set(index, new_range);
+					buffers.remove(range);
+				}else{
+					//in this case the new value is greater then the previous and the originally allocated. 
+					//the only option is to allocate a new space and to replace the region in the index.
+					final TripleLong new_range = alocateNewRange(newSize);
+					final CollectionsAccessBuffer new_buf = getBuffer(new_range);
 
-				new_buf.buffer.position(0);
-				new_buf.buffer.put(element);
+					new_buf.buffer.position(0);
+					new_buf.buffer.put(element);
 
-				index_list.set(index, new_range);
-				buffers.remove(range);
-				buf.dispose();
+					index_list.set(index, new_range);
+					buffers.remove(range);
+					buf.dispose();
+				}
 			}
+			return res;
+		}else{
+			final TripleLong new_range = alocateNewRange(element.length);
+			index_list.set(index, new_range);
+			final CollectionsAccessBuffer new_buf = getBuffer(new_range);
+			new_buf.buffer.position(0);
+			new_buf.buffer.put(element);
+			buffers.remove(new_range);
+			new_buf.dispose();
+			return null;
 		}
-		return res;
 	}
 
 	@Override

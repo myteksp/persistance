@@ -48,7 +48,7 @@ public final class PersistanceFactoryTest {
 	
 	@Test
 	public final void sanityFixedStringPersistedListsTest() throws IOException{
-		final PersistedLongList<String> list = PersistanceFactory.createFixedLongList(new File("FixedStringList.txt"), 35, 10, String.class);
+		PersistedLongList<String> list = PersistanceFactory.createFixedLongList(new File("FixedStringList.txt"), 35, 10, String.class);
 		list.add("first");
 		list.add("second");
 		list.add("third");
@@ -63,6 +63,17 @@ public final class PersistanceFactoryTest {
 			list.add("String_" + i);
 		
 		assertEquals(1000, list.size());
+		
+		list.delete();
+		list = PersistanceFactory.createFixedLongList(new File("FixedStringList1.txt"), 35, 10, String.class);
+		
+		list.set(1000, "init");
+		assertEquals(1001, list.size());
+		
+		assertEquals("init", list.get(1));
+		assertEquals("init", list.get(100));
+		assertEquals("init", list.get(500));
+		assertEquals("init", list.get(1000));
 		list.delete();
 	}
 	
