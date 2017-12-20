@@ -65,7 +65,7 @@ public final class ByteArrayLongList implements PersistedLongList<byte[]>{
 				this.ra_file = new RandomAccessFile(storage_file, "rw");
 				this.offsetBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, Long.BYTES);
 				this.offsetBuffer.position(0);
-				this.offsetBuffer.putLong(new Integer(Long.BYTES).longValue());
+				this.offsetBuffer.putLong(Integer.valueOf(Long.BYTES).longValue());
 			} catch (final Exception e) {
 				throw new RuntimeException(e);
 			}

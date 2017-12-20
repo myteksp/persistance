@@ -58,8 +58,8 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 				this.ra_file = new RandomAccessFile(storage_file, "rw");
 				this.offsetBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, 0, Long.BYTES);
 				this.offsetBuffer.position(0);
-				this.offsetBuffer.putLong(new Integer(Long.BYTES).longValue());
-				this._offset = new Integer(Long.BYTES + Long.BYTES).longValue();
+				this.offsetBuffer.putLong(Integer.valueOf(Long.BYTES).longValue());
+				this._offset = Integer.valueOf(Long.BYTES + Long.BYTES).longValue();
 
 				this.sizeBuffer = ra_file.getChannel().map(FileChannel.MapMode.READ_WRITE, Long.BYTES, Long.BYTES);
 			} catch (final Exception e) {
@@ -435,7 +435,7 @@ public final class ByteArrayMap implements PersistedMap<byte[], byte[]>{
 
 	@Override
 	public final void clear() {
-		this.setOffset(new Integer(Long.BYTES + Long.BYTES).longValue());
+		this.setOffset(Integer.valueOf(Long.BYTES + Long.BYTES).longValue());
 		this.setSize(0);
 
 		for (long i = 0; i < capacity; i++)

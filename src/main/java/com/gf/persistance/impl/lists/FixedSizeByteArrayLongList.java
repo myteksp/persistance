@@ -17,7 +17,7 @@ import com.gf.persistance.LongListIterator;
 import com.gf.persistance.PersistedLongList;
 import com.gf.persistance.impl.CollectionsAccessBuffer;
 
-public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[]>{
+public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[]>, AutoCloseable{
 	private final int ENTRY_SIZE;
 
 	private final File file;
@@ -176,12 +176,6 @@ public final class FixedSizeByteArrayLongList implements PersistedLongList<byte[
 	public final void close() throws IOException {
 		buffers.clear();
 		try {ra_file.close();} catch (final Exception e) {}
-	}
-
-	@Override
-	protected void finalize() throws Throwable {
-		close();
-		super.finalize();
 	}
 
 	@Override

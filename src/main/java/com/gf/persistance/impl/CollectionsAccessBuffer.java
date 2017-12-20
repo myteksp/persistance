@@ -3,7 +3,7 @@ package com.gf.persistance.impl;
 import java.nio.MappedByteBuffer;
 import java.util.concurrent.atomic.AtomicLong;
 
-public final class CollectionsAccessBuffer {
+public final class CollectionsAccessBuffer implements AutoCloseable{
 	private static final AtomicLong idGenerator = new AtomicLong(Long.MIN_VALUE);
 	private static final long max_id = Long.MAX_VALUE - 1000;
 	
@@ -31,12 +31,6 @@ public final class CollectionsAccessBuffer {
 	public final void dispose(){}
 	
 	@Override
-	protected final void finalize() throws Throwable {
-		try{this.dispose();}catch(final Throwable t){}
-		super.finalize();
-	}
-	
-	@Override
 	public final String toString() {
 		return "CollectionsAccessBuffer [id=" + id + ", buffer=" + buffer + ", lastAccess=" + lastAccess + ", size="
 				+ size + "]";
@@ -62,5 +56,10 @@ public final class CollectionsAccessBuffer {
 		if (id != other.id)
 			return false;
 		return true;
+	}
+
+	@Override
+	public final void close() throws Exception {
+		try{this.dispose();}catch(final Throwable t){}
 	}
 }

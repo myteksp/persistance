@@ -17,7 +17,7 @@ import java.util.ListIterator;
 import com.gf.persistance.PersistedList;
 import com.gf.persistance.impl.CollectionsAccessBuffer;
 
-public final class FixedSizeByteArrayList implements PersistedList<byte[]>{
+public final class FixedSizeByteArrayList implements PersistedList<byte[]>, AutoCloseable{
 	private final int ENTRY_SIZE;
 
 	private final File file;
@@ -151,13 +151,6 @@ public final class FixedSizeByteArrayList implements PersistedList<byte[]>{
 	@Override
 	public File getStorageFile(){
 		return null;
-	}
-
-
-	@Override
-	protected void finalize() throws Throwable {
-		close();
-		super.finalize();
 	}
 
 	private final void setSize(final int size){

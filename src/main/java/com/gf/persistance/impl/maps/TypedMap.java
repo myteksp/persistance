@@ -360,7 +360,7 @@ public final class TypedMap<K, V> implements PersistedMap<K, V>{
 			public final boolean isEmpty() {
 				return set.isEmpty();
 			}
-			@SuppressWarnings("unchecked")
+			@SuppressWarnings({ "unchecked", "unlikely-arg-type" })
 			@Override
 			public final boolean contains(final Object o) {
 				if (o == null)
